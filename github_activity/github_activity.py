@@ -5,11 +5,11 @@ import re
 import shlex
 import subprocess
 import sys
-import urllib
 from pathlib import Path
 from subprocess import PIPE
 from subprocess import run
 from tempfile import TemporaryDirectory
+from textwrap import indent
 
 import dateutil.parser
 import numpy as np
@@ -187,6 +187,7 @@ def generate_all_activity_md(
     tags=None,
     include_issues=False,
     include_opened=False,
+    include_release_notes=False,
     strip_brackets=False,
     branch=None,
 ):
@@ -218,6 +219,8 @@ def generate_all_activity_md(
         Include Issues in the markdown output. Default is False.
     include_opened : bool
         Include a list of opened items in the markdown output. Default is False.
+    include_release_notes : bool
+        Include the release notes for any PRs with `# Release notes` in the description.
     strip_brackets : bool
         If True, strip any text between brackets at the beginning of the issue/PR title.
         E.g., [MRG], [DOC], etc.
@@ -311,6 +314,7 @@ def generate_activity_md(
     tags=None,
     include_issues=False,
     include_opened=False,
+    include_release_notes=False,
     strip_brackets=False,
     heading_level=1,
     branch=None,
@@ -349,6 +353,9 @@ def generate_activity_md(
         Include Issues in the markdown output. Default is False.
     include_opened : bool
         Include a list of opened items in the markdown output. Default is False.
+    include_release_notes : bool
+        Search PR descriptions for a `# Release Notes` block. If found, include
+        the contents of this block with the changelog output for the PR.
     strip_brackets : bool
         If True, strip any text between brackets at the beginning of the issue/PR title.
         E.g., [MRG], [DOC], etc.
@@ -548,9 +555,34 @@ def generate_activity_md(
             for irow, irowdata in items["data"].iterrows():
                 author = irowdata["author"]
                 ititle = irowdata["title"]
+                description = irowdata["body"]
                 if strip_brackets and ititle.strip().startswith("[") and "]" in ititle:
                     ititle = ititle.split("]", 1)[-1].strip()
                 this_md = f"- {ititle} [#{irowdata['number']}]({irowdata['url']}) ([@{author}](https://github.com/{author}))"
+
+                # Search the description for release notes and add them if they exist
+                if include_release_notes:
+                    release_notes = []
+                    in_release_notes = False
+                    n_levels = None
+                    for ii in description.split("\n"):
+                        if in_release_notes:
+                            # If we detect a header of equal or lesser level, stop looking
+                            if ii.startswith("#") and len(ii.split(" ")[0]) <= n_levels:
+                                break
+                            # Otherwise append the line and keep going
+                            release_notes.append(ii)
+                        elif "# release notes" in ii.lower():
+                            # When we detect a release notes header,
+                            # start collecting lines underneath and define the header
+                            # level so we know when to stop
+                            in_release_notes = True
+                            n_levels = len(ii.split(" ")[0])
+
+                    if release_notes:
+                        this_md += "\n\n" + indent(
+                            "\n".join(release_notes).strip(), "  "
+                        )
                 items["md"].append(this_md)
 
     # Get functional GitHub references: any git reference or master@{YY-mm-dd}
