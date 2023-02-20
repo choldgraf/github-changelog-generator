@@ -1,15 +1,12 @@
 """Use the GraphQL api to grab issues/PRs that match a query."""
+import copy
 import datetime
 import os
 import re
 import shlex
-import subprocess
 import sys
-import urllib
-from pathlib import Path
 from subprocess import PIPE
 from subprocess import run
-from tempfile import TemporaryDirectory
 
 import dateutil.parser
 import numpy as np
@@ -18,8 +15,8 @@ import pytz
 import requests
 
 from .cache import _cache_data
+from .git import _git_get_remote_sha_and_tags
 from .graphql import GitHubGraphQlQuery
-
 
 # The tags and description to use in creating subsets of PRs
 TAGS_METADATA_BASE = {
@@ -211,6 +208,7 @@ def generate_all_activity_md(
     include_opened=False,
     strip_brackets=False,
     branch=None,
+    prefixes=None,
 ):
     """Generate a full markdown changelog of GitHub activity of a repo based on release tags.
 
@@ -245,40 +243,16 @@ def generate_all_activity_md(
         E.g., [MRG], [DOC], etc.
     branch : string | None
         The branch or reference name to filter pull requests by.
+    prefixes: dict | None
+        The prefixes for each tag, against which PR titles will be matched.
 
     Returns
     -------
     entry: str
         The markdown changelog entry for all of the release tags in the repo.
     """
-    # Get the sha and tag name for each tag in the target repo
-    with TemporaryDirectory() as td:
-
-        subprocess.run(
-            shlex.split(f"git clone https://github.com/{target} repo"), cwd=td
-        )
-        repo = os.path.join(td, "repo")
-        subprocess.run(shlex.split("git fetch origin --tags"), cwd=repo)
-
-        cmd = 'git log --tags --simplify-by-decoration --pretty="format:%h | %D"'
-        data = (
-            subprocess.check_output(shlex.split(cmd), cwd=repo)
-            .decode("utf-8")
-            .splitlines()
-        )
-
-    # Clean up the raw data
-    pattern = f"tag: {pattern}"
-
-    def filter(datum):
-        _, tag = datum
-        # Handle the HEAD tag if it exists
-        if "," in tag:
-            tag = tag.split(", ")[1]
-        return re.match(pattern, tag) is not None
-
-    data = [d.split(" | ") for (i, d) in enumerate(data)]
-    data = [d for d in data if filter(d)]
+    # Get the (SHA, tag) pairs for this target
+    data = _git_get_remote_sha_and_tags(f"https://github.com/{target}", pattern)
 
     # Generate a changelog entry for each version and sha range
     output = ""
@@ -309,6 +283,8 @@ def generate_all_activity_md(
             include_opened=include_opened,
             strip_brackets=strip_brackets,
             branch=branch,
+            tags=tags,
+            prefixes=prefixes,
         )
 
         if not md:
@@ -336,6 +312,7 @@ def generate_activity_md(
     strip_brackets=False,
     heading_level=1,
     branch=None,
+    prefixes=None,
 ):
     """Generate a markdown changelog of GitHub activity within a date window.
 
@@ -380,7 +357,8 @@ def generate_activity_md(
         With heading_level=2 those are increased to h2 and h3, respectively.
     branch : string | None
         The branch or reference name to filter pull requests by.
-
+    prefixes: dict | None
+        The prefixes for each tag, against which PR titles will be matched.
     Returns
     -------
     entry: str
@@ -509,13 +487,30 @@ def generate_activity_md(
     # Define categories for a few labels
     if tags is None:
         tags = TAGS_METADATA_BASE.keys()
-    if not all(tag in TAGS_METADATA_BASE for tag in tags):
+    # We expect an (improper) subset of tags
+    if not set(tags) <= TAGS_METADATA_BASE.keys():
         raise ValueError(
             "You provided an unsupported tag. Tags must be "
             f"one or more of {TAGS_METADATA_BASE.keys()}, You provided:\n"
             f"{tags}"
         )
-    tags_metadata = {key: val for key, val in TAGS_METADATA_BASE.items() if key in tags}
+    # Define per-category prefixes
+    if prefixes is None:
+        prefixes = {}
+
+    # Override default prefixes with user-specified ones
+    default_prefixes = {t: v['pre'] for t, v in TAGS_METADATA_BASE.items()}
+    prefixes = {**default_prefixes, **prefixes}
+    # Take the lowercase of the prefixes
+    prefixes = {t: [s.lower() for s in p] for t, p in prefixes.items()}
+
+    # Build tag metadata
+    tags_metadata = {}
+    for tag in tags:
+        tags_metadata[tag] = {
+            **TAGS_METADATA_BASE[tag],
+            "pre": prefixes[tag]
+        }
 
     # Initialize our tags with empty metadata
     for key, vals in tags_metadata.items():
@@ -535,7 +530,7 @@ def generate_activity_md(
         )
         # Now find PRs based on prefix
         mask_pre = closed_prs["title"].map(
-            lambda title: any(f"{ipre}:" in title for ipre in kindmeta["pre"])
+            lambda title: any(f"{ipre}:" in title.lower() for ipre in kindmeta["pre"])
         )
         mask = mask | mask_pre
 
